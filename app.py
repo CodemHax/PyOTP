@@ -1,157 +1,153 @@
-from flask import Flask, request, jsonify
-from dataclasses import dataclass
-import random
+import uvicorn
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, EmailStr, Field
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timedelta
-import os
-import logging
-import smtplib
-from pymongo import MongoClient
 from werkzeug.security import generate_password_hash, check_password_hash
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import smtplib
+import random
+import os
+from starlette.middleware.base import BaseHTTPMiddleware
+import asyncio
 
 load_dotenv()
-app = Flask(__name__)
 
-# MongoDB configuration
-MONGO_URI = os.getenv("MONGO_URI")
-client = MongoClient(MONGO_URI)
-db = client.otp_database
-otp_collection = db.otps
+app = FastAPI()
 
-EMAIL_CONFIGS = {
-    "gmail": {"host": "smtp.gmail.com", "port": 587},
-}
-
-EMAIL_PROVIDER = "gmail"
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
 EMAIL_USERNAME = os.getenv("EMAIL_USERNAME")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 API_TOKEN = os.getenv("API_TOKEN")
+EMAIL_FROM = os.getenv("EMAIL_FROM")
 
-logging.basicConfig(level=logging.INFO)
+EMAIL_PROVIDER = "smtp2go"
+EMAIL_CONFIGS = {
+    "smtp2go": {"host": "mail.smtp2go.com", "port": 2525}
+}
 
-# Initialize Flask-Limiter with MongoDB as the storage backend
-limiter = Limiter(
-    key_func=get_remote_address,
-    storage_uri=MONGO_URI,
-    default_limits=["10 per minute"]
-)
-limiter.init_app(app)
+client = AsyncIOMotorClient(MONGO_URI)
+db = client.otp_database
+otps = db.otps
 
-@dataclass
-class EmailRequest:
-    email: str
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
 
-@dataclass
-class OTPVerification:
-    email: str
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429, content={"detail": "Too many requests"})
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
+app.add_middleware(SecurityHeadersMiddleware)
+
+class SendOTP(BaseModel):
+    email: EmailStr
+
+class VerifyOTP(BaseModel):
+    email: EmailStr
     otp: str
 
-def token_required(f):
-    def decorator(*args, **kwargs):
-        token = request.headers.get('X-API-Token')
-        if not token or token != API_TOKEN:
-            return jsonify({"detail": "Invalid or missing API token"}), 403
-        return f(*args, **kwargs)
-    return decorator
+def require_token(request: Request):
+    token = request.headers.get("X-API-Token")
+    if token != API_TOKEN:
+        raise HTTPException(status_code=403, detail="Unauthorized")
 
 def generate_otp():
-    return "".join([str(random.randint(0, 9)) for _ in range(4)])
+    return "".join(str(random.randint(0, 9)) for i in range(6))
 
-def send_email(to_email: str, otp: str):
-    try:
-        if not EMAIL_USERNAME or not EMAIL_PASSWORD:
-            logging.error("Email credentials are not set")
-            return False
+def send_mail(email: str, otp: str):
+    msg = MIMEMultipart()
+    msg["From"] = EMAIL_FROM
+    msg["To"] = email
+    msg["Subject"] = "OTP Verification"
+    msg.attach(
+        MIMEText(f"Your OTP is {otp}. It expires in 5 minutes.", "plain")
+    )
 
-        msg = MIMEMultipart()
-        msg["From"] = EMAIL_USERNAME
-        msg["To"] = to_email
-        msg["Subject"] = "Your OTP for Verification"
-        body = f"""
-        Your OTP is: {otp}
-        This OTP will expire in 5 minutes.
-        Please do not share this OTP with anyone.
-        """
-        msg.attach(MIMEText(body, "plain"))
+    cfg = EMAIL_CONFIGS[EMAIL_PROVIDER]
+    server = smtplib.SMTP(cfg["host"], cfg["port"])
+    server.starttls()
+    server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+    server.send_message(msg)
+    server.quit()
 
-        server_config = EMAIL_CONFIGS[EMAIL_PROVIDER]
 
-        server = smtplib.SMTP(server_config["host"], server_config["port"])
-        server.starttls()
-        server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        return True
-    except Exception as e:
-        logging.error(f"Error sending email: {e}")
-        return False
+@app.get("/")
+def health():
+    return {"status": "ok"}
 
-@app.route("/", methods=["GET"], endpoint="check_alive")
-def check_alive():
-    return jsonify({"message": "Server is running"})
-
-@app.route("/send-otp", methods=["POST"], endpoint="send_otp")
-@token_required
-@limiter.limit("7 per minute")
-def send_otp():
-    data = request.get_json()
-    email_request = EmailRequest(**data)
+@app.post("/send_otp")
+@limiter.limit("25/minute")
+async def send_otp(data: SendOTP, request: Request, token_check=Depends(require_token)):
     otp = generate_otp()
-    hashed_otp = generate_password_hash(otp)
-    if send_email(email_request.email, otp):
-        otp_collection.update_one(
-            {"email": email_request.email},
-            {
-                "$set": {
-                    "otp": hashed_otp,
-                    "created_at": datetime.now(),
-                    "verified": False
-                }
-            },
-            upsert=True
+
+    await otps.update_one(
+        {"email": data.email},
+        {
+            "$set": {
+                "otp": generate_password_hash(otp),
+                "created_at": datetime.now(timezone.utc),
+                "verified": False,
+                "failed_attempts": 0
+            }
+        },
+        upsert=True
+    )
+
+    await asyncio.to_thread(send_mail, data.email, otp)
+    return JSONResponse(status_code=202, content={"message": "OTP sent"})
+
+@app.post("/verify_otp")
+@limiter.limit("50/minute")
+async def verify_otp(data: VerifyOTP, request: Request, token_check=Depends(require_token)):
+    record = await otps.find_one({"email": data.email})
+
+    if not record:
+        raise HTTPException(status_code=400, detail="OTP not found")
+
+    if datetime.now(timezone.utc) - record["created_at"] > timedelta(minutes=5):
+        await otps.delete_one({"email": data.email})
+        raise HTTPException(status_code=400, detail="OTP expired")
+
+    if record["verified"]:
+        raise HTTPException(status_code=400, detail="OTP already used")
+
+    if record.get("failed_attempts", 0) >= 3:
+        raise HTTPException(status_code=400, detail="Too many failed attempts")
+
+    if not check_password_hash(record["otp"], data.otp):
+        await otps.update_one(
+            {"email": data.email},
+            {"$inc": {"failed_attempts": 1}}
         )
-        return jsonify({"message": "OTP sent successfully"})
-    return jsonify({"detail": "Failed to send OTP"}), 500
+        raise HTTPException(status_code=400, detail="Invalid OTP")
 
-@app.route("/verify-otp", methods=["POST"], endpoint="verify_otp")
-@token_required
-def verify_otp():
-    data = request.get_json()
-    otp_verification = OTPVerification(**data)
-    otp_record = otp_collection.find_one({"email": otp_verification.email})
-
-    if not otp_record:
-        return jsonify({"detail": "No OTP found for this email"}), 400
-
-    if datetime.now() - otp_record["created_at"] > timedelta(minutes=5):
-        otp_collection.delete_one({"email": otp_verification.email})
-        return jsonify({"detail": "OTP expired"}), 400
-
-    if not check_password_hash(otp_record["otp"], otp_verification.otp):
-        return jsonify({"detail": "Invalid OTP"}), 400
-
-    if otp_record["verified"]:
-        return jsonify({"detail": "OTP already used"}), 400
-
-    otp_collection.update_one(
-        {"email": otp_verification.email},
+    await otps.update_one(
+        {"email": data.email},
         {"$set": {"verified": True}}
     )
-    return jsonify({"message": "OTP verified successfully"}), 200
 
-@app.route("/otp-stats", methods=["GET"], endpoint="otp_stats")
-@token_required
-def otp_stats():
-    total_otps = otp_collection.count_documents({})
-    verified_otps = otp_collection.count_documents({"verified": True})
-    return jsonify({
-        "total_otps": total_otps,
-        "verified_otps": verified_otps
-    })
+    return JSONResponse(status_code=200, content={"message": "OTP verified"})
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+@app.get("/otp_stats")
+async def stats(token_check=Depends(require_token)):
+    return {
+        "total": await otps.count_documents({}),
+        "verified": await otps.count_documents({"verified": True})
+    }
+
