@@ -1,0 +1,11 @@
+fastapi~=0.127.1
+uvicorn~=0.40.0
+pydantic[email]~=2.12.5
+python-dotenv~=1.2.1
+motor~=3.7.1
+werkzeug~=3.1.4
+slowapi~=0.1.9
+dotenv~=0.9.9
+starlette~=0.50.0
+requests~=2.32.5
+pydantic-settings~=2.12.0
