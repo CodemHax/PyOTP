@@ -117,27 +117,6 @@ EMAIL_FROM=your_email@example.com
 EXPIRE_TIME=5  # OTP expiration time in minutes
 ```
 
-### Preventing .env File from Being Pushed to GitHub
-**Important**: Never commit your `.env` file to version control as it contains sensitive credentials.
-
-The project already includes a `.gitignore` file that excludes `.env` files. To ensure your environment file is not tracked:
-
-1. **Verify .gitignore**: Check that `.env` is listed in your `.gitignore` file (it already is)
-2. **Check if already tracked**: Run `git status` to see if `.env` is listed
-3. **If already tracked, remove it**:
-   ```sh
-   git rm --cached .env
-   git commit -m "Remove .env from tracking"
-   ```
-4. **Create .env.example**: Create a template file for others:
-   ```sh
-   # Copy your .env and remove sensitive values
-   cp .env .env.example
-   # Edit .env.example to replace actual values with placeholders
-   ```
-
-**Best Practice**: Always use `.env.example` with placeholder values in your repository, and document required environment variables in the README.
-
 ## Testing
 Run tests using:
 ```sh
